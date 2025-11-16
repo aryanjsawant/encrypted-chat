@@ -49,3 +49,4 @@ package-lock.json
 .cache
 /.pnp\
 .pnp.js
+__pycache__

@@ -5,7 +5,10 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const path = require('path');
-const { deriveKeyFromPasswordSync, encrypt, decrypt } = require('./crypto-utils');
+
+// Python crypto wrapper (async)
+const Crypto = require('./crypto-utils');
+
 const Message = require('./models/message');
 
 const app = express();
@@ -20,35 +23,58 @@ mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopol
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('❌ MongoDB connection error:', err));
 
-// Derive master key for AES encryption
 const MASTER_PW = process.env.MASTER_PASSWORD || 'change_this';
-const masterKey = deriveKeyFromPasswordSync(MASTER_PW, 'fixedsalt123'); // consistent key across restarts
 
-io.on('connection', (socket) => {
+// Pre-derive master key once at startup (Python → hex → Buffer)
+let masterKeyHex = null;
+
+async function initMasterKey() {
+  try {
+    masterKeyHex = await Crypto.deriveKey(MASTER_PW);
+    console.log("🔑 Master key derived (Python):", masterKeyHex);
+  } catch (err) {
+    console.error("❌ Failed to derive master key:", err);
+    process.exit(1);
+  }
+}
+
+initMasterKey(); // Run async but doesn't block server start
+
+io.on('connection', async (socket) => {
   console.log('🟢 client connected', socket.id);
 
-  // Send decrypted chat history to this client
-  Message.find().sort({ timestamp: 1 }).limit(100).lean().exec()
-    .then(docs => {
-      const history = docs.map(d => {
-        let plain = '[decryption failed]';
-        try {
-          plain = decrypt(d.message, masterKey);
-        } catch (e) {
-          // likely key mismatch, skip
-        }
-        return { sender: d.sender, message: plain, ts: d.timestamp };
-      });
-      socket.emit('chat history', history);
-    })
-    .catch(err => console.error(err));
+  // Load history from DB
+  try {
+    const docs = await Message.find().sort({ timestamp: 1 }).limit(100).lean().exec();
 
-  // Handle incoming chat messages
+    const history = [];
+    for (const d of docs) {
+      let plain = '[decryption failed]';
+      try {
+        plain = await Crypto.decrypt(MASTER_PW, d.message);
+      } catch (e) {
+        // ignore failures
+      }
+      history.push({ sender: d.sender, message: plain, ts: d.timestamp });
+    }
+
+    socket.emit('chat history', history);
+
+  } catch (err) {
+    console.error("❌ Error sending chat history:", err);
+  }
+
+  // Handle incoming messages
   socket.on('chat message', async (data) => {
     if (!data || !data.message || !data.sender) return;
 
-    // Encrypt message before storing
-    const encrypted = encrypt(data.message, masterKey);
+    let encrypted = null;
+    try {
+      encrypted = await Crypto.encrypt(MASTER_PW, data.message);
+    } catch (err) {
+      console.error("❌ Encryption failed:", err);
+      return;
+    }
 
     const msgDoc = new Message({
       sender: data.sender,
@@ -58,15 +84,21 @@ io.on('connection', (socket) => {
     try {
       await msgDoc.save();
     } catch (err) {
-      console.error('DB save error:', err);
+      console.error('❌ DB save error:', err);
     }
 
-    // Send plaintext back to connected clients
-    io.emit('chat message', { sender: data.sender, message: data.message, ts: new Date() });
+    // Emit plaintext (not encrypted) to clients
+    io.emit('chat message', {
+      sender: data.sender,
+      message: data.message,
+      ts: new Date()
+    });
   });
 
   socket.on('disconnect', () => console.log('🔴 client disconnected', socket.id));
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Server listening on http://localhost:${PORT}`));
+server.listen(PORT, () =>
+  console.log(`🚀 Server listening on http://localhost:${PORT}`)
+);
